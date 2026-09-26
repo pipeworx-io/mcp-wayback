@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-wayback",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Internet Archive Wayback Machine MCP.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-adc6509292d52c24ae511e2779271eb55b7205fa838479bcef9424423776e5de",
-    "sourceCommit": "b0fb3c31386cf0256dcf1e2f1b3440435a87ec35"
+    "sourceHash": "v1-b8fd20e584c759cb5eba6c9be0f696105bde18338af723afbb235cae981825e1",
+    "sourceCommit": "2cb50b368da3267446f2b6f6a3ddbd3d0eed3d73"
   }
 }
