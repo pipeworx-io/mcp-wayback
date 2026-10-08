@@ -25,6 +25,188 @@ interface McpToolExport {
 }
 
 /**
+ * Decode a body from its BYTES, choosing the charset in a stated order and
+ * saying which rule chose it.
+ *
+ * Why this exists (fleet #2742, #2729): the egress relay read an ISO-8859-1
+ * page with `Response.text()`, which assumes UTF-8 when the header carries no
+ * charset, and re-wrapped the result. Every 0xA7 byte -- the section sign in a
+ * statute index -- became EF BF BD (U+FFFD), and the output still read as
+ * plausible text. The bytes were gone before anything could notice. The rule
+ * that follows from it: read bytes, hash bytes, THEN decode, and never let the
+ * decoder guess silently.
+ *
+ * Resolution order (reported as `charset_source`):
+ *   1. `bom`           a byte-order mark (UTF-8, UTF-16LE, UTF-16BE)
+ *   2. `content-type`  `charset=` on the Content-Type header
+ *   3. `html-meta`     `<meta charset>` or `http-equiv` Content-Type in the
+ *                      first 1,024 bytes
+ *   4. `xml-decl`      `<?xml ... encoding="...">` at the start of the body
+ *   5. `utf8-valid`    the bytes decode as UTF-8 with `fatal: true`
+ *   6. `fallback`      windows-1252, which is what WHATWG decodes `iso-8859-1`
+ *                      as anyway, and which maps every byte to a character
+ *
+ * A label the runtime's TextDecoder does not know is skipped and the next rule
+ * is tried; `ignored_labels` names it so a caller can see the page lied.
+ *
+ * `decode_replacements` counts U+FFFD characters that DECODING introduced --
+ * the ones already present in the source as UTF-8 EF BF BD are subtracted.
+ * Non-zero means the text is lossy; the bytes (and any hash over them) are not.
+ */
+
+type CharsetSource = 'bom' | 'content-type' | 'html-meta' | 'xml-decl' | 'utf8-valid' | 'fallback';
+
+interface CharsetChoice {
+  /** The WHATWG encoding name TextDecoder resolved the label to. */
+  charset: string;
+  charset_source: CharsetSource;
+  /** Labels found in the header/meta/decl that TextDecoder rejected. */
+  ignored_labels: string[];
+  /** BOM bytes to skip (TextDecoder strips a matching BOM itself; kept for callers that slice). */
+  bom_length: number;
+}
+
+interface DecodedText extends CharsetChoice {
+  text: string;
+  decode_replacements: number;
+}
+
+const META_SCAN_BYTES = 1024;
+
+/** Normalize a label through TextDecoder; null when the runtime does not know it. */
+function resolveLabel(label: string): string | null {
+  const l = label.trim().replace(/^["']|["']$/g, '').toLowerCase();
+  if (!l) return null;
+  try {
+    return new TextDecoder(l).encoding;
+  } catch {
+    return null;
+  }
+}
+
+/** The `charset=` parameter of a Content-Type header value, or null. */
+function contentTypeCharset(contentType: string | null | undefined): string | null {
+  if (!contentType) return null;
+  const m = /;\s*charset\s*=\s*("?)([^";\s]+)\1/i.exec(contentType);
+  return m ? m[2] : null;
+}
+
+function bomOf(b: Uint8Array): { charset: string; length: number } | null {
+  if (b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) return { charset: 'utf-8', length: 3 };
+  if (b.length >= 2 && b[0] === 0xfe && b[1] === 0xff) return { charset: 'utf-16be', length: 2 };
+  if (b.length >= 2 && b[0] === 0xff && b[1] === 0xfe) return { charset: 'utf-16le', length: 2 };
+  return null;
+}
+
+/** ASCII view of the first `n` bytes. Bytes > 0x7F become '?' so regexes stay ASCII-only. */
+function asciiHead(b: Uint8Array, n: number): string {
+  const end = Math.min(b.length, n);
+  let s = '';
+  for (let i = 0; i < end; i++) s += b[i] < 0x80 ? String.fromCharCode(b[i]) : '?';
+  return s;
+}
+
+function metaCharset(head: string): string | null {
+  // <meta charset="x"> and <meta http-equiv="Content-Type" content="text/html; charset=x">
+  // both reduce to "charset=" inside a <meta ...> tag.
+  const tagRe = /<meta\b[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(head))) {
+    const c = /charset\s*=\s*["']?\s*([A-Za-z0-9._:-]+)/i.exec(m[0]);
+    if (c) return c[1];
+  }
+  return null;
+}
+
+function xmlDeclCharset(head: string): string | null {
+  const m = /^\s*<\?xml\b[^>]*\bencoding\s*=\s*["']([A-Za-z0-9._:-]+)["']/i.exec(head);
+  return m ? m[1] : null;
+}
+
+function isValidUtf8(b: Uint8Array): boolean {
+  try {
+    new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(b);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Choose a charset for `bytes` without decoding the whole body. */
+function chooseCharset(bytes: Uint8Array, contentType?: string | null): CharsetChoice {
+  const ignored: string[] = [];
+  const bom = bomOf(bytes);
+  if (bom) return { charset: bom.charset, charset_source: 'bom', ignored_labels: ignored, bom_length: bom.length };
+
+  const header = contentTypeCharset(contentType);
+  if (header) {
+    const r = resolveLabel(header);
+    if (r) return { charset: r, charset_source: 'content-type', ignored_labels: ignored, bom_length: 0 };
+    ignored.push(header);
+  }
+
+  const head = asciiHead(bytes, META_SCAN_BYTES);
+  const meta = metaCharset(head);
+  if (meta) {
+    let r = resolveLabel(meta);
+    // HTML spec: a meta declaring UTF-16 is a lie (the meta itself was readable
+    // as ASCII), so it means UTF-8.
+    if (r === 'utf-16le' || r === 'utf-16be') r = 'utf-8';
+    if (r) return { charset: r, charset_source: 'html-meta', ignored_labels: ignored, bom_length: 0 };
+    ignored.push(meta);
+  }
+
+  const decl = xmlDeclCharset(head);
+  if (decl) {
+    const r = resolveLabel(decl);
+    if (r) return { charset: r, charset_source: 'xml-decl', ignored_labels: ignored, bom_length: 0 };
+    ignored.push(decl);
+  }
+
+  if (isValidUtf8(bytes)) return { charset: 'utf-8', charset_source: 'utf8-valid', ignored_labels: ignored, bom_length: 0 };
+  return { charset: 'windows-1252', charset_source: 'fallback', ignored_labels: ignored, bom_length: 0 };
+}
+
+function countFffdInText(s: string): number {
+  let n = 0;
+  for (let i = s.indexOf('\uFFFD'); i !== -1; i = s.indexOf('\uFFFD', i + 1)) n++;
+  return n;
+}
+
+function countEfBfBd(b: Uint8Array): number {
+  let n = 0;
+  for (let i = 0; i + 2 < b.length; i++) {
+    if (b[i] === 0xef && b[i + 1] === 0xbf && b[i + 2] === 0xbd) {
+      n++;
+      i += 2;
+    }
+  }
+  return n;
+}
+
+/**
+ * Decode `bytes` with an already-chosen charset (e.g. one chosen over a whole
+ * body, applied to a window of it). Counts only the U+FFFD that decoding
+ * introduced.
+ */
+function decodeWithCharset(bytes: Uint8Array, charset: string): { text: string; decode_replacements: number } {
+  // TextDecoder strips a BOM that matches its own encoding; ignoreBOM:false is the default.
+  const text = new TextDecoder(charset).decode(bytes);
+  const present = charset === 'utf-8' ? countEfBfBd(bytes) : 0;
+  return { text, decode_replacements: Math.max(0, countFffdInText(text) - present) };
+}
+
+/**
+ * Decode `bytes` to text. `bytes` is never modified; hash it before or after,
+ * the answer is the same.
+ */
+function decodeBytes(bytes: Uint8Array, contentType?: string | null): DecodedText {
+  const choice = chooseCharset(bytes, contentType);
+  return { ...choice, ...decodeWithCharset(bytes, choice.charset) };
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -823,6 +1005,136 @@ async function getCaptureCount(url: string): Promise<unknown> {
     first: raw[1]?.[0] ?? null,
     last: raw[raw.length - 1]?.[0] ?? null,
   };
+}
+
+/* ───────────── exported helpers for the gateway's archive_evidence compound ─────────────
+ * Not MCP tools. workers/gateway/src/archive-evidence.ts (fleet #2820) imports
+ * these so the compound reuses THIS pack's client (UA, timeout bound, URL
+ * shapes) instead of carrying a second Wayback client. Both throw LOUD — the
+ * Wayback front end answers overload with a 200-free "Temporarily Offline"
+ * HTML page (503) or a 429, and a caller of a compound must see that status,
+ * never an empty capture list that reads as "never archived".
+ */
+
+export interface WaybackCapture {
+  /** YYYYMMDDhhmmss */
+  timestamp: string;
+  original: string;
+  statuscode: string;
+  mimetype: string;
+  digest: string;
+  length: number | null;
+}
+
+/**
+ * The `limit` captures of `url` closest in time to `timestamp`, nearest first
+ * (CDX `sort=closest`). Unfiltered on purpose: a server-side
+ * `filter=statuscode:200` turned a ~1 s answer into 24 s-to-timeout when
+ * probed 2026-10-08, so callers filter the rows themselves. An empty array is
+ * a real "no capture of this URL anywhere"; a transport or parse failure throws.
+ */
+export async function closestCaptures(url: string, timestamp: string, limit = 60): Promise<WaybackCapture[]> {
+  const n = Math.min(Math.max(1, Math.floor(limit)), 500);
+  const target =
+    `${CDX}?url=${encodeURIComponent(url)}&output=json&sort=closest&closest=${encodeURIComponent(timestamp)}` +
+    `&limit=${n}&fl=timestamp,original,statuscode,mimetype,digest,length`;
+  const res = await pwFetch(target, { headers: { Accept: 'application/json', 'User-Agent': UA } });
+  const body = await res.text();
+  if (!res.ok) {
+    throw new Error(`Wayback CDX returned HTTP ${res.status}${says(summarizeErrorBody(body))}`);
+  }
+  if (!body.trim()) return [];
+  let raw: unknown;
+  try {
+    raw = JSON.parse(body);
+  } catch {
+    throw new Error(`Wayback CDX returned HTTP ${res.status} but the body is not JSON${says(summarizeErrorBody(body))}`);
+  }
+  if (!Array.isArray(raw)) throw new Error('Wayback CDX returned JSON that is not a row array — the API shape changed');
+  if (raw.length <= 1) return [];
+  const header = raw[0] as string[];
+  const col = (name: string) => header.indexOf(name);
+  const [ti, oi, si, mi, di, li] = ['timestamp', 'original', 'statuscode', 'mimetype', 'digest', 'length'].map(col);
+  return (raw.slice(1) as string[][]).map((row) => ({
+    timestamp: row[ti] ?? '',
+    original: row[oi] ?? '',
+    statuscode: row[si] ?? '',
+    mimetype: row[mi] ?? '',
+    digest: row[di] ?? '',
+    length: row[li] && /^\d+$/.test(row[li]) ? Number(row[li]) : null,
+  }));
+}
+
+/**
+ * The single closest capture from the "available" API — a different Wayback
+ * service from the CDX, and the one that still answered from a Cloudflare
+ * Worker on 2026-10-08 while the CDX returned 429/503. Used as the fallback
+ * when closestCaptures() fails. Returns null when the archive holds nothing.
+ */
+export async function availableClosest(url: string, timestamp: string): Promise<{ timestamp: string; url: string; status: string } | null> {
+  const target = `${AVAILABLE}?url=${encodeURIComponent(url)}&timestamp=${encodeURIComponent(timestamp)}`;
+  const res = await pwFetch(target, { headers: { Accept: 'application/json', 'User-Agent': UA } });
+  const body = await res.text();
+  if (!res.ok) throw new Error(`Wayback availability API returned HTTP ${res.status}${says(summarizeErrorBody(body))}`);
+  let data: { archived_snapshots?: { closest?: { url?: string; timestamp?: string; status?: string } } };
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error(`Wayback availability API returned HTTP ${res.status} but the body is not JSON${says(summarizeErrorBody(body))}`);
+  }
+  const c = data.archived_snapshots?.closest;
+  if (!c?.timestamp || !c.url) return null;
+  // The snapshot URL is web.archive.org/web/<ts>/<original>; recover <original>.
+  const m = /\/web\/\d{14}[a-z_]*\/(.+)$/.exec(c.url);
+  return { timestamp: c.timestamp, url: m ? m[1] : url, status: c.status ?? '' };
+}
+
+/**
+ * The page bytes exactly as captured (the `id_` replay, no Wayback toolbar or
+ * URL rewriting), decoded to text and cut at `maxBytes`. Throws on any
+ * non-2xx so a 429/503 is never mistaken for an empty page.
+ *
+ * The charset is chosen from the BYTES by shared/src/charset.ts (BOM, then the
+ * header, then the page's own <meta>/XML declaration, then UTF-8 if valid,
+ * else windows-1252). It used to default to UTF-8 whenever the header carried
+ * no charset, which is the #2742 bug: every Latin-1 section sign in an
+ * archived statute page came back as U+FFFD (fleet #2729/#2847).
+ */
+export async function fetchCaptureBody(
+  original: string,
+  timestamp: string,
+  maxBytes = 1_500_000,
+): Promise<{ status: number; content_type: string | null; body: string; bytes: number; truncated: boolean; replay_url: string; charset: string; charset_source: string; decode_replacements: number }> {
+  const replay = `https://web.archive.org/web/${timestamp}id_/${original}`;
+  const res = await pwFetch(replay, { headers: { 'User-Agent': UA } });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Wayback replay returned HTTP ${res.status} for ${timestamp}/${original}${says(summarizeErrorBody(t))}`);
+  }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const truncated = buf.length > maxBytes;
+  const ct = res.headers.get('content-type');
+  // Chosen over the WHOLE capture (the UTF-8 validity rule needs every byte);
+  // only the kept window is decoded.
+  const choice = chooseCharset(buf, ct);
+  const kept = truncated ? buf.subarray(0, maxBytes) : buf;
+  const { text: body, decode_replacements } = decodeWithCharset(kept, choice.charset);
+  return {
+    status: res.status,
+    content_type: ct,
+    body,
+    bytes: buf.length,
+    truncated,
+    replay_url: `https://web.archive.org/web/${timestamp}/${original}`,
+    charset: choice.charset,
+    charset_source: choice.charset_source,
+    decode_replacements,
+  };
+}
+
+/** `: <what the upstream said>` — summarizeErrorBody already reduced it to a sentence (an HTML page to its title, "Internet Archive: Temporarily Offline"). */
+function says(summary: string): string {
+  return summary ? `: ${summary.slice(0, 200)}` : '';
 }
 
 async function httpError(res: Response): Promise<{ error: number; message: string }> {
